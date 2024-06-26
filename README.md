@@ -3,6 +3,6 @@ This is a master thesis project done by Ezgi Günbatar for Applied Data Science 
 
 The study aims to find an answer to the “Do the individual characteristics and the social network attributes affect women’s desire to have children?” question. For this purpose, individual and network characteristics are used for predicting the having children intentions.
 
-In this context, methods such as Graph Neural Networks, Gradient Boosting Decision Tree, Random Forest, and Support Vector Machine were used for predicting fertility intentions.
+In this context, methods such as Graph Neural Networks, Gradient Boosting Decision Tree, Random Forest, and Support Vector Machine were used for predicting fertility intentions. Go to the separate folder to see each method that was used and their results.
 
 
