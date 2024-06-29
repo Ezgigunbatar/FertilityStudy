@@ -1,0 +1,503 @@
+---
+title: "Thesis"
+format: html
+editor: visual
+---
+
+Preparation
+
+Packages
+
+```{r}
+# package for loading in and processing data
+library(FertNet)
+# packages for data wrangling
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(purrr)
+library(lattice)
+library(forcats)
+library(stringr)
+# package for exporting table
+library(writexl)
+# package for LASSO regression
+library(glmnet)
+# packages for calculating network characteristics
+library(igraph)
+library(tidygraph)
+# package for description
+library(skimr)
+# packages for visualisation
+library(ggplot2)
+install.packages("ggeconodist", repos = "https://cinc.rud.is")
+library(ggeconodist)
+library(patchwork)
+library(cowplot)
+library(tidytext) # for ordering within facets
+library(ggforce) # for facet_row
+library(ggtext)
+```
+
+Session info
+
+```{r}
+sessionInfo()
+```
+
+```{r}
+setwd("/Users/ezgigunbatar/Desktop/Thesis/R_fertility/Fertility_v1")
+```
+
+Data
+
+```{r}
+# requires files "wj18a_EN_1.0p.sav" and "avars_201802_EN_1.0p.sav" to
+# be stored in working directory, downloaded from https://www.lissdata.nl/
+raw <- FertNet::produce_data(background_vars = TRUE)
+
+```
+
+# Sample selection
+
+```{r}
+exclude <- c(
+  # reported fewer than 25 alters, or mentioned same person twice
+  "alters reported < 25", 
+  "alters reported < 25 & >= 10 missing on alter attributes", 
+  "Listed child below 18 & alters reported < 25 & all alter-ties missing & >= 10 missing on alter attributes", 
+  "25 alters too many", 
+  "removed duplicate alter", 
+  # reported no existing ties between alters
+  "all alter-ties missing", 
+  "all alter-ties missing & >= 10 missing on alter attributes", 
+  # did survey on phone/ipad against explicit instructions
+  "survey on phone/ipad", 
+  "survey on phone/ipad & >= 10 missing on alter attributes", 
+  "probably on phone", 
+  "survey on phone/ipad & all alter-ties missing & >= 10 missing on alter attributes", 
+  # reported problematic alter relations
+  "problematic alter relations & >= 10 missing on alter attributes",
+  # more than 10 missing values on 'mandatory' alter attribute questions
+  ">= 10 missing on alter attributes"  
+)
+
+data <- raw |> filter(!(notes %in% exclude))
+
+#Removing the timing attributes
+#data <- produce_data(remove_timing_vars = TRUE)
+```
+
+# Creating variables
+
+## Ego variables
+
+```{r}
+data <- data |>
+  mutate(
+    # produce numerical variables of categorical variables
+    partner_num = case_when(partner == "Yes" ~ 1, 
+                            partner == "No" ~ 0),
+    has_child_num = case_when(has_children == "Yes" ~ 1,  
+                              has_children == "No" ~ 0),
+    # create binary variable of education
+    educ_bin = case_when(
+      educ_CBS %in% c("wo (university)", 
+                      "hbo (higher vocational education, US: college)") ~ 1,
+      educ_CBS %in% c("primary school", 
+                      "vmbo (intermediate secondary education, US: junior high school)",
+                      "havo/vwo (higher secondary education/preparatory university education, US: senior high school)",
+                      "mbo (intermediate vocational education, US: junior college)") ~ 0,
+      .default = 0), # assumes missing is lower educated
+    # create numeric variable of number of children
+    child_num = case_when(
+      has_children == "No" ~ 0,
+      has_children == "Yes" ~ num_children),
+    # Number of children desired
+    ideal_child_num = ifelse(ideal_family_size == "I don't know", NA, as.numeric(ideal_family_size)),
+    childwish_num = as.numeric(childwish),
+    happiness_num = ifelse(happiness_children == "I don't know", NA, as.numeric(happiness_children)),
+    pressure_f_num = ifelse(pressure_friends == "I don't know", NA, as.numeric(pressure_friends)),
+    pressure_p_num = ifelse(pressure_parents %in% c("I don't know", "Not applicable"), 
+                            NA, as.numeric(pressure_parents))
+    
+  )
+
+ego_vars <- c("age", "educ_bin", "net_income", "partner_num", "child_num")
+outcome_vars <- c("ideal_child_num", "childwish_num", "happiness_num",
+                  "pressure_f_num", "pressure_p_num")
+
+# CHECKS
+# all(table(data$partner_num, useNA = "always") %in% table(data$partner, useNA = "always") )
+# all(table(data$has_child_num, useNA = "always") %in% table(data$has_children, useNA = "always") )
+# all(table(data$ideal_child_num, useNA = "always") %in% table(data$ideal_family_size, useNA = "always") )
+# all(table(data$happiness_num, useNA = "always") %in% table(data$happiness_children, useNA = "always") )
+# table(data$educ_CBS, useNA = "always"); table(data$educ_bin, useNA = "always")
+# all(table(data$pressure_f_num, useNA = "always") %in% table(data$pressure_friends, useNA = "always") )
+# table(data$pressure_p_num, useNA = "always"); table(data$pressure_parents, useNA = "always") 
+```
+
+## Network: tie strength variables
+
+```{r}
+# Function to create numerical versions of tiestrength variables
+# Returns dataframe that has added three variables to input dataframe
+tie_strength_numeric <- function(alter_attr) {
+ alter_attr$closeness = as.numeric(alter_attr$closeness_a) 
+ alter_attr$f2f = as.numeric(alter_attr$contact_f2f_a) 
+ alter_attr$non_f2f = as.numeric(alter_attr$contact_other_a) 
+ return(alter_attr)
+}
+# names(data$alter_attr[[1]])
+# table(data$alter_attr[[1]]$closeness_a, useNA = "always")
+# table(as.numeric(data$alter_attr[[1]]$closeness_a), useNA = "always")
+# table(data$alter_attr[[16]]$contact_f2f_a, useNA = "always")
+# table(as.numeric(data$alter_attr[[16]]$contact_f2f_a), useNA = "always")
+# table(data$alter_attr[[300]]$contact_other_a, useNA = "always")
+# table(as.numeric(data$alter_attr[[300]]$contact_other_a), useNA = "always")
+
+# Function to create binary (0/1) versions of relevant node attributes variables
+# 0 = no, 1 = yes
+# Returns dataframe that has added several variables to input dataframe
+alter_attr_binary <- function(alter_attr) {
+ alter_attr$female = case_when(alter_attr$sex_a == "Female" ~ 1,
+                               alter_attr$sex_a == "Male" ~ 0)
+ # HBO of hoger (> 4) = 1
+ alter_attr$edu = as.numeric(as.numeric(alter_attr$education_a) >= 4)
+ alter_attr$friend = case_when(alter_attr$friend_a == "Yes, is a friend" ~ 1,
+                               alter_attr$friend_a == "No, is not a friend" ~ 0)
+ # Exclude parents in counts for children
+ alter_attr$has_child = case_when(
+   alter_attr$primary_relation_a == "Parent" ~ as.numeric(NA),
+   alter_attr$has_child_a == "Does have (a) child(ren) or is expecting a child" ~ 1,
+   alter_attr$has_child_a == "Does not have (a) child(ren) and is not expecting a child" ~ 0)
+ alter_attr$wants_child = case_when(
+   alter_attr$childwish_a == "Wishes to have children" ~ 1,
+   alter_attr$childwish_a == "I don't know whether person wishes to have children" ~ 0)
+ alter_attr$wants_no_child = case_when(
+   alter_attr$childfree_a == "Prefers to remain childless" ~ 1,
+   alter_attr$childfree_a == "I don't know whether person wishes to remain childless" ~ 0)
+ alter_attr$help = case_when(
+   alter_attr$help_child_a == "Could ask for help in caring for child" ~ 1,
+   alter_attr$help_child_a == "Could not ask for help in caring for child" ~ 0)
+ alter_attr$talk = case_when(
+   alter_attr$talk_child_a == "Do discuss having children with this person" ~ 1,
+   alter_attr$talk_child_a == "Do not discuss having children with this person" ~ 0)
+ alter_attr$kin = case_when(
+   alter_attr$primary_relation_a %in% c("Parent", "Sibling", "Kin", "In-law") ~ 1,
+   TRUE ~ 0)
+ # Not binary but categorical
+ alter_attr$kin_afkin_friend_other = case_when(
+   alter_attr$kin == 1 ~ "Kin",
+   alter_attr$kin == 0 & alter_attr$friend == 1 ~ "Friend",
+   alter_attr$kin == 0 & alter_attr$friend != 1 ~ "Not friend"
+ )
+ return(alter_attr)
+}
+
+data <- data |>
+  mutate(
+    # Create numerical versions of tie strength variables
+    alter_attr = map(alter_attr, function(x) tie_strength_numeric(x)),
+    # Create binary versions of relevant node characteristics
+    alter_attr = map(alter_attr, function(x) alter_attr_binary(x))
+  ) 
+
+# Below code creates average closeness / frequency of contact
+# Also for separate groups
+data <- data |>
+  mutate(
+    # Average closeness, frequency of contact
+    mean_closeness = map_dbl(alter_attr, function(x) mean(x$closeness, na.rm = TRUE) ),
+    mean_f2f = map_dbl(alter_attr, function(x) mean(x$f2f, na.rm = TRUE) ),
+    mean_nonf2f = map_dbl(alter_attr, function(x) mean(x$non_f2f, na.rm = TRUE) ),
+    # Average closeness for separate groups
+    mean_closeness_kin = map_dbl(
+      alter_attr, function(x) mean(x$closeness[x$kin == 1], na.rm = TRUE) ),
+    mean_closeness_friends = map_dbl(
+      alter_attr, function(x) mean(x$closeness[x$friend == 1], na.rm = TRUE) ),
+    mean_closeness_has_kid = map_dbl(
+      alter_attr, function(x) mean(x$closeness[x$has_child == 1], na.rm = TRUE) ),
+    mean_closeness_want_kid = map_dbl(
+      alter_attr, function(x) mean(x$closeness[x$wants_child == 1], na.rm = TRUE) ),
+    mean_closeness_wants_no_kid = map_dbl(
+      alter_attr, function(x) mean(x$closeness[x$wants_no_child == 1], na.rm = TRUE) ),
+    mean_closeness_help = map_dbl(
+      alter_attr, function(x) mean(x$closeness[x$help == 1], na.rm = TRUE) ),
+    mean_closeness_talk = map_dbl(
+      alter_attr, function(x) mean(x$closeness[x$talk == 1], na.rm = TRUE) ),
+    # Average f2f-contact for separate groups
+    mean_f2f_kin = map_dbl(
+      alter_attr, function(x) mean(x$f2f[x$kin == 1], na.rm = TRUE) ),
+    mean_f2f_friends = map_dbl(
+      alter_attr, function(x) mean(x$f2f[x$friend == 1], na.rm = TRUE) ),
+    mean_f2f_has_kid = map_dbl(
+      alter_attr, function(x) mean(x$f2f[x$has_child == 1], na.rm = TRUE) ),
+    mean_f2f_want_kid = map_dbl(
+      alter_attr, function(x) mean(x$f2f[x$wants_child == 1], na.rm = TRUE) ),
+    mean_f2f_wants_no_kid = map_dbl(
+      alter_attr, function(x) mean(x$f2f[x$wants_no_child == 1], na.rm = TRUE) ),
+    mean_f2f_help = map_dbl(
+      alter_attr, function(x) mean(x$f2f[x$help == 1], na.rm = TRUE) ),
+    mean_f2f_talk = map_dbl(
+      alter_attr, function(x) mean(x$f2f[x$talk == 1], na.rm = TRUE) ),
+    # Average non-f2f-contact for separate groups
+    mean_nonf2f_kin = map_dbl(
+      alter_attr, function(x) mean(x$non_f2f[x$kin == 1], na.rm = TRUE) ),
+    mean_nonf2f_friends = map_dbl(
+      alter_attr, function(x) mean(x$non_f2f[x$friend == 1], na.rm = TRUE) ),
+    mean_nonf2f_has_kid = map_dbl(
+      alter_attr, function(x) mean(x$non_f2f[x$has_child == 1], na.rm = TRUE) ),
+    mean_nonf2f_want_kid = map_dbl(
+      alter_attr, function(x) mean(x$non_f2f[x$wants_child == 1], na.rm = TRUE) ),
+    mean_nonf2f_wants_no_kid = map_dbl(
+      alter_attr, function(x) mean(x$non_f2f[x$wants_no_child == 1], na.rm = TRUE) ),
+        mean_nonf2f_help = map_dbl(
+      alter_attr, function(x) mean(x$non_f2f[x$help == 1], na.rm = TRUE) ),
+    mean_nonf2f_talk = map_dbl(
+      alter_attr, function(x) mean(x$non_f2f[x$talk == 1], na.rm = TRUE) )
+  )
+
+# create variants of vars that have 1 (lowest tie strength) if group is missing
+
+# List of variables that include many NaNs
+tie_vars_NA <- c(
+  "mean_closeness_kin", "mean_closeness_friends", 
+  "mean_closeness_has_kid", "mean_closeness_want_kid", "mean_closeness_wants_no_kid", 
+  "mean_closeness_help", "mean_closeness_talk", 
+  "mean_f2f_kin", "mean_f2f_friends", 
+  "mean_f2f_has_kid", "mean_f2f_want_kid", "mean_f2f_wants_no_kid", 
+  "mean_f2f_help", "mean_f2f_talk", 
+  "mean_nonf2f_kin", "mean_nonf2f_friends", 
+  "mean_nonf2f_has_kid", "mean_nonf2f_want_kid", "mean_nonf2f_wants_no_kid",
+  "mean_nonf2f_help", "mean_nonf2f_talk")
+
+# This replaces all NaN to 1 for selected variables and creates new variables
+# NaN means e.g., that respondents had no people in network with children, so
+# mean_closeness_has_kid is NaN. Imputing 1 implies the lowest possible score.
+data <- data |>
+  mutate(across(.cols = all_of(tie_vars_NA), 
+                .fns = function(x) if_else(is.nan(x), 1, x),
+                .names = "{.col}_cor"))
+```
+
+## **Network: composition variables**
+
+```{r}
+# Create variables on composition (e.g. number of women, number of kin, ...)
+data <- data |>
+  mutate(
+    no_women = map_dbl(alter_attr, function(x) sum(x$female, na.rm = TRUE) ),
+    # this creates how many alters are older than respondent
+    no_older = map2_int(
+      age, alter_attr, 
+      function(x, y) sum(case_when(y$age_a == "18-" ~ 0L,
+                                   y$age_a == "50+" ~ 1L,
+                                   as.numeric(y$age_a) > x ~ 1L, 
+                                   as.numeric(y$age_a) <= x ~ 0L, 
+                                   TRUE ~ as.numeric(NA)), na.rm = TRUE) ),
+    no_friends = map_dbl(alter_attr, function(x) sum(x$friend, na.rm = TRUE) ),
+    no_kin = map_dbl(alter_attr, function(x) sum(x$kin, na.rm = TRUE) ),
+    no_high_edu = map_dbl(alter_attr, function(x) sum(x$edu, na.rm = TRUE) ),
+    # exclude parents in counts of number of children
+    no_has_child = map_dbl(alter_attr, function(x) sum(x$has_child, na.rm = TRUE) ),
+    # total number of children
+    no_child_total = map_dbl(
+      alter_attr,
+      function(x) sum(case_when(
+        x$primary_relation_a == "Parent" ~ as.numeric(NA),
+        x$has_child == 0 ~ 0,
+        is.na(x$num_child_a) ~ as.numeric(NA),
+        x$num_child_a == "Expecting first child" ~ 1,
+        x$num_child_a == "More than 5" ~ 6,
+        x$num_child_a == "I don't know" ~ 1,
+        x$num_child_a %in% paste0(1:5) ~ as.numeric(x$num_child_a)), na.rm = TRUE) ),
+    # number of children below 5
+    no_child_u5 = map_dbl(
+      alter_attr,
+      function(x) sum(case_when(
+        x$primary_relation_a == "Parent" ~ as.numeric(NA),
+        x$has_child == 0 ~ 0,
+        is.na(x$age_child_a) ~ as.numeric(NA),
+        x$age_child_a == "I don't know" ~ as.numeric(NA),
+        x$age_child_a == "Older than 5 years" ~ 0,
+        TRUE ~ 1), na.rm = TRUE) ),
+    # number of people who became less happy after birth children
+    no_child_less_happy = map_dbl(
+      alter_attr,
+      function(x) sum(case_when(
+        x$primary_relation_a == "Parent" ~ as.numeric(NA),
+        x$has_child == 0 ~ 0,
+        is.na(x$happiness_child_a) ~ as.numeric(NA),
+        x$happiness_child_a == "[PERSON 1 to 25]'s happiness in life became less after the birth of the child(ren)" ~ 1,
+        TRUE ~ 0), na.rm = TRUE) ),
+    no_wants_child = map_dbl(alter_attr, function(x) sum(x$wants_child, na.rm = TRUE) ),
+    no_wants_no_child = map_dbl(alter_attr, function(x) sum(x$wants_no_child, na.rm = TRUE) ),
+    no_help = map_dbl(alter_attr, function(x) sum(x$help, na.rm = TRUE) ),
+    no_talk = map_dbl(alter_attr, function(x) sum(x$talk, na.rm = TRUE) )
+  )
+
+# Some checks,
+# data_un <- data %>% select(nomem_encr, alter_attr) %>% unnest(alter_attr)
+# sum(data$alter_attr[data$nomem_encr == 800714][[1]]$talk_child_a == "Do discuss having children with this person") == data$no_talk[data$nomem_encr == 800714]
+# sum(data_un$talk_child_a == "Do discuss having children with this person") == sum(data$no_talk, na.rm = TRUE)
+# Total number of children check
+# Happiness variables check
+# sum(data$no_child_less_happy) == sum( data_un$happiness_child_a[data_un$primary_relation_a != "Parent"] == "[PERSON 1 to 25]'s happiness in life became less after the birth of the child(ren)", na.rm = TRUE) 
+# data_un <- data_un %>% 
+#   mutate(
+#     check_children = case_when(
+#         primary_relation_a == "Parent" ~ as.numeric(NA),
+#         has_child == 0 ~ 0,
+#         is.na(num_child_a) ~ as.numeric(NA),
+#         num_child_a == "Expecting first child" ~ 1,
+#         num_child_a == "More than 5" ~ 6,
+#         num_child_a == "I don't know" ~ 1,
+#         num_child_a %in% paste0(1:5) ~ as.numeric(num_child_a)),
+#     check_age = case_when(
+#         primary_relation_a == "Parent" ~ as.numeric(NA),
+#         has_child == 0 ~ 0,
+#         is.na(age_child_a) ~ as.numeric(NA),
+#         age_child_a == "I don't know" ~ as.numeric(NA),
+#         age_child_a == "Older than 5 years" ~ 0,
+#         TRUE ~ 1)
+#   )
+# # Check variables total number of children and under 5
+# sum(data_un$check_children, na.rm = TRUE) == sum(data$no_child_total, na.rm = TRUE)
+# sum(data$no_child_total, na.rm = TRUE) == (data_un %>% group_by(nomem_encr) %>% summarise(no_kids_check = sum(check_children, na.rm = TRUE)) %>% pull(no_kids_check) %>% sum )
+# sum(data_un$check_age, na.rm = TRUE) == sum(data$no_child_u5, na.rm = TRUE)
+# sum(data$no_child_u5, na.rm = TRUE) == (data_un %>% group_by(nomem_encr) %>% summarise(no_kids5_check = sum(check_age, na.rm = TRUE)) %>% pull(no_kids5_check) %>% sum )
+```
+
+## **Network: structural variables**
+
+```{r}
+# This creates variable "tidygraph"
+data <- data |> FertNet::create_tidygraph()
+
+# This function calculates density (proportion of ties)
+# within particular family (e.g, kin or friends)
+density_among_group <- function(tidygraph, group = expression(kin_afkin_friend_other == "Kin")) {
+  if(!("tbl_graph" %in% class(tidygraph))) return(NA) 
+  tidygraph_sel <- tidygraph|>
+    activate(nodes) |>
+    filter(!!group[[1]]) # requires atomic vector
+  igraph::edge_density(tidygraph_sel)
+}
+# density_among_group(data$tidygraph[[20]])
+# density_among_group(data$tidygraph[[20]], group = expression(kin_afkin_friend_other == "Kin" | kin_afkin_friend_other == "Friend"))
+# data$tidygraph[[20]]|> activate(nodes) |>filter(kin_afkin_friend_other == "Kin")
+# temp <- expression(kin_afkin_friend_other == "Kin")
+# data$tidygraph[[20]] |> activate(nodes) |> filter(!!temp[[1]])
+
+# create structure variables based on network object
+data <- data |>
+  mutate(
+    density = map_dbl(
+      tidygraph, 
+      function(x) if(!("tbl_graph" %in% class(x))) {NA} else {igraph::edge_density(x)}) , # based on, e.g., Lubbers et al (2007); Bidart et al 2018; Stulp & Barrett (2021)
+    density_kin = map_dbl(tidygraph, 
+      function(x) density_among_group(x, group = expression(kin_afkin_friend_other == "Kin"))),
+    density_friends = map_dbl(tidygraph, 
+      function(x) density_among_group(x, group = expression(kin_afkin_friend_other == "Friend"))),
+    density_children = map_dbl(tidygraph, 
+      function(x) density_among_group(x, group = expression(has_child == 1))),
+    density_wantschildren = map_dbl(tidygraph, 
+      function(x) density_among_group(x, group = expression(wants_child == 1))),
+    density_childfree = map_dbl(tidygraph, 
+      function(x) density_among_group(x, group = expression(wants_no_child == 1))),
+    density_talk = map_dbl(tidygraph, 
+      function(x) density_among_group(x, group = expression(talk == 1))),
+    density_help = map_dbl(tidygraph, 
+      function(x) density_among_group(x, group = expression(help == 1))),
+    # Community detection based on Girvan-Newman community-detection algorithm through cluster_edge_betweenness
+    # https://igraph.org/c/html/latest/igraph-Community.html#igraph_community_edge_betweenness
+    # https://search.r-project.org/CRAN/refmans/igraph/html/cluster_edge_betweenness.html
+    community_detection = map(tidygraph, function(x) igraph::cluster_edge_betweenness(x, directed = FALSE) ), # based on Vacca (2019), 
+    community_sizes = map(community_detection, function(x) c(table(x$membership))), 
+    comm_1or2 = map_dbl(community_sizes, function(x) sum(x <= 2)), # based on Vacca (2019)
+    comm_3orhigher = map_dbl(community_sizes, function(x) sum(x >= 3)), # based on Vacca (2019), sort of Lubbers et al (2007) (there >=2)
+    modularity = map_dbl(community_detection, function(x) igraph::modularity(x)), # based on Vacca (2019)
+    comp_largest = map_int(tidygraph, function(x) max(igraph::components(x)$csize) ), # based on Bidart et al (2018)
+    diameter = map_dbl(tidygraph, igraph::diameter), # based on Bidart et al (2018)
+    # https://igraph.org/r/doc/centr_betw.html
+    between_centr = map_dbl(tidygraph, function(x) igraph::centr_betw(x, normalized = TRUE, directed = FALSE)$centralization ), # based on Bidart et al  (2018) & Lubbers et al (2007) 
+    # https://igraph.org/r/doc/centr_degree.html
+    degree_centr = map_dbl(tidygraph, function(x) igraph::centr_degree(x, normalized = TRUE, loops = FALSE, mode = "all")$centralization ), # based on Maya-Jariego (2021)
+    avg_betweenness = map_dbl(tidygraph, function(x) mean(igraph::betweenness(x, normalized = TRUE, directed = FALSE)) ), # based on Maya-Jariego (2021)
+    # 'regular' avg_closeness is missing for all networks with isolates (433 out of 706 respondents)
+    # avg_closeness = map_dbl(tidygraph, function(x) mean(igraph::closeness(x, normalized = TRUE)) ), # based on Maya-Jariego (2021)
+    avg_closeness = map_dbl(tidygraph, function(x) mean(igraph::harmonic_centrality(x, normalized = TRUE)) ), 
+    avg_eigenv = map_dbl(tidygraph, function(x) mean(igraph::eigen_centrality(x, directed = FALSE, scale = TRUE)$vector) ), # based on Maya-Jariego (2021)
+    cliques = map_dbl(tidygraph, igraph::count_max_cliques), # based on Maya-Jariego (2021)
+    components = map_dbl(tidygraph, igraph::count_components) # based on Maya-Jariego (2021)
+  )
+
+# Vector with names of structural variables minus density variables
+struc_vars <- c("comm_1or2", "comm_3orhigher", "modularity", "comp_largest", 
+                "diameter", "between_centr", "degree_centr", "avg_betweenness", 
+                "avg_closeness", "avg_closeness_h", "avg_eigenv", "cliques", "components")
+
+# Vector with names of density variables with NAs
+dens_vars_NA <- c("density_kin", "density_friends", 
+                  "density_children", "density_wantschildren", "density_childfree", 
+                  "density_talk", "density_help")
+
+# This replaces all NaN to 0 for selected variables and creates new variables
+# NaN means e.g., that respondents had no people in network with children, so
+# density_children is NaN. Imputing 0 implies lowest possible score.
+data <- data |>
+  mutate(across(.cols = all_of(dens_vars_NA), 
+                .fns = function(x) if_else(is.nan(x), 0, x),
+                .names = "{.col}_cor"))
+```
+
+## 
+
+**Saving each ego and her alters as CSVs (For GNN model)**
+
+```{r}
+
+# Load necessary libraries
+if (!require("igraph")) install.packages("igraph")
+library(igraph)
+
+# Base directory for participant data
+base_dir <- "participants"
+dir.create(base_dir, showWarnings = FALSE)
+
+# Assuming 'data' is your dataframe
+# Export Respondent attributes - overall, not per participant
+columns_to_exclude <- c("alter_attr", "edgelist", "tidygraph", "community_detection", "community_sizes")
+data_subset <- data[, !(names(data) %in% columns_to_exclude)]
+write.csv(data_subset, "data_subset.csv", row.names = FALSE)
+
+# Iterate over each row in the dataframe to handle data for each participant
+for (i in 1:nrow(data)) {
+  # Create a directory for each participant using a unique identifier, e.g., 'nomem_encr'
+  participant_dir <- paste0(base_dir, "/", data$nomem_encr[i])
+  dir.create(participant_dir, showWarnings = FALSE)
+  # Export Alter attributes
+  # Check if the 'alter_attr' column has a nested dataframe
+  if (!is.null(data$alter_attr[[i]])) {
+    alter_filename <- paste0(participant_dir, "/alters.csv")
+    write.csv(data$alter_attr[[i]], alter_filename, row.names = FALSE)
+  }
+
+  # Export Edgelist to GraphML
+  # Check if the 'edgelist' column contains an edge list dataframe
+  if (!is.null(data$edgelist[[i]])) {
+    g <- graph_from_data_frame(data$edgelist[[i]], directed = FALSE)
+    
+    # Add all nodes from 'alter_attr' if not already in graph
+    if (!is.null(data$alter_attr[[i]])) {
+      all_nodes <- unique(c(data$alter_attr[[i]]$names_a))  # Assuming 'id' is the column name for node identifiers
+      nodes_to_add <- setdiff(all_nodes, V(g)$name)  # Find nodes not in the graph
+      g <- add_vertices(g, length(nodes_to_add), name = nodes_to_add)
+    }
+    
+    graphml_filename <- paste0(participant_dir, "/edgelist.graphml")
+    write_graph(g, graphml_filename, format = "graphml")
+  }
+}
+```
